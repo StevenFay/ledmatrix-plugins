@@ -98,30 +98,12 @@ def download_missing_logo(sport_key: str, team_id: str, team_abbr: str, logo_pat
             logger.error(f"Failed to create logo directory {logo_dir}: {e}")
             return False
 
-        # If we have a logo URL, try to download it
         if logo_url and not logo_url.lower().startswith("https://"):
             logger.warning(f"Skipping non-HTTPS logo URL for {team_abbr}: {logo_url}")
             logo_url = None
-        if logo_url:
-            try:
-                response = _downloader.session.get(logo_url, headers=_downloader.headers, timeout=_downloader.request_timeout)
-                if response.status_code == 200:
-                    # Verify it's an image
-                    content_type = response.headers.get('content-type', '').lower()
-                    if any(img_type in content_type for img_type in ['image/png', 'image/jpeg', 'image/jpg', 'image/gif']):
-                        with open(logo_path, 'wb') as f:
-                            f.write(response.content)
-                        logger.info(f"Downloaded logo for {team_abbr} from {logo_url}")
-                        return True
-            except PermissionError as e:
-                logger.error(f"Permission denied downloading logo for {team_abbr}: {e}")
-                logger.error("Please run: sudo ./scripts/fix_perms/fix_assets_permissions.sh")
-                return False
-            except Exception as e:
-                logger.error(f"Failed to download logo for {team_abbr}: {e}")
-
-        # If no URL or download failed, create a placeholder
-        return create_placeholder_logo(team_abbr, logo_path)
+        if not logo_url:
+            return False
+        return _fetch_logo(logo_url, logo_path, team_abbr)
 
     except PermissionError as e:
         logger.error(f"Permission denied for {team_abbr}: {e}")
@@ -129,11 +111,73 @@ def download_missing_logo(sport_key: str, team_id: str, team_abbr: str, logo_pat
         return False
     except Exception as e:
         logger.error(f"Failed to download logo for {team_abbr}: {e}")
-        # Try to create placeholder as fallback
-        try:
-            return create_placeholder_logo(team_abbr, logo_path)
-        except Exception:
-            return False
+        return False
+
+
+#: Largest logo download accepted. ESPN's are 500x500 PNGs of tens of KB.
+MAX_LOGO_BYTES = 2 * 1024 * 1024
+
+
+def _fetch_logo(logo_url: str, logo_path: Path, team_abbr: str) -> bool:
+    """Download ``logo_url`` to ``logo_path`` as an RGBA PNG.
+
+    Nothing is written to ``logo_path`` unless the bytes are an image Pillow
+    can decode: the download goes to a temp file beside it and is moved into
+    place only once converted. A failure leaves no file -- not a placeholder,
+    which used to be saved under the real logo's name, so the "already have
+    it" check never let the logo be fetched again. The renderer draws its own
+    placeholder for a team without a crest.
+    """
+    tmp = logo_path.with_name(logo_path.name + ".part")
+    try:
+        with _downloader.session.get(logo_url, headers={**_downloader.headers, "Accept": "image/*"},
+                                     timeout=_downloader.request_timeout, stream=True) as response:
+            if response.status_code != 200:
+                logger.warning(f"Logo for {team_abbr} not downloaded: HTTP {response.status_code}")
+                return False
+            content_type = response.headers.get("content-type", "").lower()
+            if not content_type.startswith("image/"):
+                logger.warning(f"Logo for {team_abbr} is not an image ({content_type!r})")
+                return False
+            received = 0
+            with open(tmp, "wb") as f:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    received += len(chunk)
+                    if received > MAX_LOGO_BYTES:
+                        raise ValueError("logo larger than the download limit")
+                    f.write(chunk)
+        with Image.open(tmp) as img:
+            img.load()
+            rgba = img.convert("RGBA")
+        rgba.save(tmp, "PNG")
+        tmp.replace(logo_path)
+        logger.info(f"Downloaded logo for {team_abbr} from {logo_url}")
+        return True
+    except PermissionError as e:
+        logger.error(f"Permission denied downloading logo for {team_abbr}: {e}")
+        logger.error("Please run: sudo ./scripts/fix_perms/fix_assets_permissions.sh")
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to download logo for {team_abbr}: {e}")
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def is_placeholder_logo(path: Path) -> bool:
+    """Whether ``path`` holds a placeholder that create_placeholder_logo
+    saved under a real logo's name (plugin 1.3.3 and earlier did, on a failed
+    download): 64x64 and nothing in it but transparency and greys (white text,
+    black outline, anti-aliased edges between)."""
+    try:
+        with Image.open(path) as img:
+            if img.size != (64, 64):
+                return False
+            colours = img.convert("RGBA").getcolors(64 * 64) or []
+    except Exception:
+        return False
+    return all(a == 0 or r == g == b for _count, (r, g, b, a) in colours)
+
 
 def create_placeholder_logo(team_abbr: str, logo_path: Path) -> bool:
     """Create a simple placeholder logo."""

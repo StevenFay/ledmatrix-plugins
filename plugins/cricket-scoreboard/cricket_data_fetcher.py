@@ -405,10 +405,14 @@ class CricketDataFetcher:
                 "description": ls.get("description", "") or "",
             })
 
-        logo_url = None
+        # ESPN's cricket feeds give a team's logo as "logo" (a URL); only that
+        # was missed, as "logos" (a list) -- which cricket teams don't carry --
+        # was the one read, so no team ever had a logo URL and every crest
+        # without a bundled flag drew as a placeholder. The same rule as the
+        # other scoreboards: "logo" first, then the first of "logos".
         logos = team.get("logos") or []
-        if logos:
-            logo_url = logos[0].get("href")
+        first = logos[0] if logos and isinstance(logos[0], dict) else {}
+        logo_url = team.get("logo") or first.get("href") or None
 
         records = ""
         rec = c.get("records") or []

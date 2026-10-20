@@ -33,9 +33,10 @@ from cricket_data_fetcher import CricketDataFetcher
 from cricket_renderer import CricketRenderer
 
 try:
-    from cricket_logo_downloader import download_missing_logo
+    from cricket_logo_downloader import download_missing_logo, is_placeholder_logo
 except ImportError:  # pragma: no cover
     download_missing_logo = None
+    is_placeholder_logo = None
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,9 @@ MODE_UPCOMING = "cricket_upcoming"
 # ESPN competition keys that represent bundled national-team flags rather than
 # auto-downloaded franchise logos.
 _INTERNATIONAL_KEY = "international"
+
+#: Seconds before a team whose logo download failed is tried again.
+_LOGO_RETRY_SECONDS = 30 * 60
 
 
 class CricketScoreboardPlugin(BasePlugin if BasePlugin else object):
@@ -225,10 +229,12 @@ class CricketScoreboardPlugin(BasePlugin if BasePlugin else object):
         recent = recent[: self.recent_games_to_show]
         upcoming = upcoming[: self.upcoming_games_to_show]
 
-        # Auto-download franchise logos (national teams use bundled flags).
+        # Download every team's ESPN logo the renderer has no bundled flag
+        # for. National teams used to be skipped outright, so a side without
+        # one of the bundled flags (Netherlands, Scotland, a women's XI named
+        # "Australia Women", ...) only ever drew a placeholder.
         for m in live + recent + upcoming:
-            if m.get("competition_key") != _INTERNATIONAL_KEY:
-                self._ensure_logos(m)
+            self._ensure_logos(m)
 
         with self._lock:
             self.live_matches = live
@@ -257,21 +263,33 @@ class CricketScoreboardPlugin(BasePlugin if BasePlugin else object):
     def _ensure_logos(self, match: Dict[str, Any]) -> None:
         if download_missing_logo is None:
             return
+        retry_at = self.__dict__.setdefault("_logo_retry_at", {})
+        now = time.time()
         for team in match.get("teams", []):
             abbr = (team.get("abbr") or "").upper()
             abbr = "".join(c for c in abbr if c.isalnum() or c in ("&", "_"))
             url = team.get("logo_url")
             if not abbr or not url:
                 continue
+            if self.renderer.has_bundled_flag(team):
+                continue        # the renderer draws the bundled flag first
             path = self.logos_dir / f"{abbr}.png"
             if path.parent != self.logos_dir:
                 continue
-            if path.exists():
+            # 1.3.3 and earlier saved a placeholder under the logo's own name
+            # when a download failed, which this check then took for the logo.
+            if path.exists() and not (is_placeholder_logo and is_placeholder_logo(path)):
+                continue
+            if now < retry_at.get(abbr, 0.0):
                 continue
             try:
-                download_missing_logo("cricket", team.get("id", ""), abbr, path, url)
+                if download_missing_logo("cricket", team.get("id", ""), abbr, path, url):
+                    retry_at.pop(abbr, None)
+                    self.renderer.forget_crest(team)
+                    continue
             except Exception as e:
                 self.logger.debug("Logo download failed for %s: %s", abbr, e)
+            retry_at[abbr] = now + _LOGO_RETRY_SECONDS
 
     # ------------------------------------------------------------------ #
     # Display

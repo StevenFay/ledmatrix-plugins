@@ -144,35 +144,66 @@ class CricketRenderer:
 
     # ---- team crest (flag / logo / placeholder) --------------------------- #
 
-    def _load_crest(self, team: Dict[str, Any], size: int) -> Optional[Image.Image]:
-        """Load a national-team flag or franchise logo, cached by key+size."""
+    @staticmethod
+    def _crest_names(team: Dict[str, Any]):
         abbr = (team.get("abbr") or "").upper()
         name = (team.get("name") or "").lower().replace(" ", "_")
+        return abbr, name
+
+    def _crest_candidates(self, team: Dict[str, Any], flags_only: bool = False) -> List[Path]:
+        """Bundled flag files first, then downloaded logos."""
+        abbr, name = self._crest_names(team)
+        flags_dir = _PLUGIN_DIR / "assets" / "flags"
+        logos_dir = _PLUGIN_DIR / "assets" / "logos"
+        dirs = (flags_dir,) if flags_only else (flags_dir, logos_dir)
+        candidates: List[Path] = []
+        for key in (abbr, name):
+            if key:
+                candidates += [d / f"{key}.png" for d in dirs]
+        return candidates
+
+    def has_bundled_flag(self, team: Dict[str, Any]) -> bool:
+        """Whether a bundled national flag will be drawn for ``team``."""
+        return any(p.exists() for p in self._crest_candidates(team, flags_only=True))
+
+    def forget_crest(self, team: Dict[str, Any]) -> None:
+        """Drop ``team``'s cached crest (every size), so a newly downloaded
+        logo is drawn from the next frame."""
+        abbr, name = self._crest_names(team)
+        prefix = f"{abbr}:{name}:"
+        for key in [k for k in self._img_cache if str(k).startswith(prefix)]:
+            del self._img_cache[key]
+
+    def _load_crest(self, team: Dict[str, Any], size: int) -> Optional[Image.Image]:
+        """Load a national-team flag or franchise logo, cached by key+size.
+
+        Only a crest that loaded is cached. Caching "none" too meant a logo
+        downloaded after a team's first frame was never drawn until restart.
+        """
+        abbr, name = self._crest_names(team)
         cache_key = f"{abbr}:{name}:{size}"
         if cache_key in self._img_cache:
             return self._img_cache[cache_key]
 
-        candidates: List[Path] = []
-        flags_dir = _PLUGIN_DIR / "assets" / "flags"
-        logos_dir = _PLUGIN_DIR / "assets" / "logos"
-        if abbr:
-            candidates += [flags_dir / f"{abbr}.png", logos_dir / f"{abbr}.png"]
-        if name:
-            candidates += [flags_dir / f"{name}.png", logos_dir / f"{name}.png"]
-
         img = None
-        for path in candidates:
+        for path in self._crest_candidates(team):
             if path.exists():
                 try:
                     with Image.open(path) as raw:
-                        crest = raw.convert("RGBA").resize((size, size), Image.NEAREST)
+                        # NEAREST keeps the bundled pixel-art flags crisp, but
+                        # turns a 500px downloaded ESPN logo into noise at
+                        # panel size; shrink downloaded logos smoothly.
+                        downloaded = path.parent.name == "logos"
+                        resample = Image.LANCZOS if downloaded else Image.NEAREST
+                        crest = raw.convert("RGBA").resize((size, size), resample)
                         crest.load()
                     img = crest
                     break
                 except Exception as e:
                     logger.debug("Crest load failed %s: %s", path, e)
 
-        self._img_cache[cache_key] = img
+        if img is not None:
+            self._img_cache[cache_key] = img
         return img
 
     def _draw_team_crest(self, img: Image.Image, draw: ImageDraw.ImageDraw,
